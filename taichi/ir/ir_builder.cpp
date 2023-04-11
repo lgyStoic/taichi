@@ -270,6 +270,10 @@ UnaryOpStmt *IRBuilder::create_log(Stmt *value) {
   return insert(Stmt::make_typed<UnaryOpStmt>(UnaryOpType::log, value));
 }
 
+UnaryOpStmt *IRBuilder::create_popcnt(Stmt *value) {
+  return insert(Stmt::make_typed<UnaryOpStmt>(UnaryOpType::popcnt, value));
+}
+
 BinaryOpStmt *IRBuilder::create_add(Stmt *l, Stmt *r) {
   return insert(Stmt::make_typed<BinaryOpStmt>(BinaryOpType::add, l, r));
 }
@@ -336,10 +340,6 @@ BinaryOpStmt *IRBuilder::create_shr(Stmt *l, Stmt *r) {
 
 BinaryOpStmt *IRBuilder::create_sar(Stmt *l, Stmt *r) {
   return insert(Stmt::make_typed<BinaryOpStmt>(BinaryOpType::bit_sar, l, r));
-}
-
-BinaryOpStmt *IRBuilder::create_popcnt(Stmt *l, Stmt *r) {
-  return insert(Stmt::make_typed<BinaryOpStmt>(BinaryOpType::min, l, r));
 }
 
 BinaryOpStmt *IRBuilder::create_cmp_lt(Stmt *l, Stmt *r) {
