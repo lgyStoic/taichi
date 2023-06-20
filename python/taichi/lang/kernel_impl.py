@@ -12,6 +12,7 @@ import numpy as np
 import taichi.lang
 from taichi._lib import core as _ti_core
 from taichi.lang import impl, ops, runtime_ops
+from taichi.lang.any_array import AnyArray
 from taichi.lang._wrap_inspect import getsourcefile, getsourcelines
 from taichi.lang.argpack import ArgPackType, ArgPack
 from taichi.lang.ast import (
@@ -226,12 +227,12 @@ class Func:
         if self.is_real_function:
             if impl.get_runtime().current_kernel.autodiff_mode != AutodiffMode.NONE:
                 raise TaichiSyntaxError("Real function in gradient kernels unsupported.")
-            instance_id, _ = self.mapper.lookup(args)
+            instance_id, arg_features = self.mapper.lookup(args)
             key = _ti_core.FunctionKey(self.func.__name__, self.func_id, instance_id)
             if self.compiled is None:
                 self.compiled = {}
             if key.instance_id not in self.compiled:
-                self.do_compile(key=key, args=args)
+                self.do_compile(key=key, args=args, arg_features=arg_features)
             return self.func_call_rvalue(key=key, args=args)
         tree, ctx = _get_tree_and_ctx(
             self,
@@ -257,6 +258,12 @@ class Func:
                     non_template_args.append(ops.cast(args[i], anno))
                 elif isinstance(anno, primitive_types.RefType):
                     non_template_args.append(_ti_core.make_reference(args[i].ptr))
+                elif isinstance(anno, ndarray_type.NdarrayType):
+                    if not isinstance(args[i], AnyArray):
+                        raise TaichiTypeError(
+                            f"Expected ndarray in the kernel argument for argument {kernel_arg.name}, got {args[i]}"
+                        )
+                    non_template_args.append(args[i].ptr)
                 else:
                     non_template_args.append(args[i])
         non_template_args = impl.make_expr_group(non_template_args, real_func_arg=True)
@@ -272,10 +279,14 @@ class Func:
             return Expr(_ti_core.make_get_element_expr(func_call.ptr, (0,)))
         if isinstance(self.return_type, StructType):
             return self.return_type.from_taichi_object(func_call, (0,))
+        if isinstance(self.return_type, MatrixType):
+            return self.return_type.from_taichi_object(func_call, (0,))
         raise TaichiTypeError(f"Unsupported return type: {self.return_type}")
 
-    def do_compile(self, key, args):
-        tree, ctx = _get_tree_and_ctx(self, is_kernel=False, args=args, is_real_function=self.is_real_function)
+    def do_compile(self, key, args, arg_features):
+        tree, ctx = _get_tree_and_ctx(
+            self, is_kernel=False, args=args, arg_features=arg_features, is_real_function=self.is_real_function
+        )
         fn = impl.get_runtime().prog.create_function(key)
 
         def func_body():
@@ -341,7 +352,7 @@ class TaichiCallableTemplateMapper:
         self.mapping = {}
 
     @staticmethod
-    def extract_arg(arg, anno):
+    def extract_arg(arg, anno, arg_name):
         if isinstance(anno, template):
             if isinstance(arg, taichi.lang.snode.SNode):
                 return arg.ptr
@@ -350,7 +361,7 @@ class TaichiCallableTemplateMapper:
             if isinstance(arg, _ti_core.Expr):
                 return arg.get_underlying_ptr_address()
             if isinstance(arg, tuple):
-                return tuple(TaichiCallableTemplateMapper.extract_arg(item, anno) for item in arg)
+                return tuple(TaichiCallableTemplateMapper.extract_arg(item, anno, arg_name) for item in arg)
             if isinstance(arg, taichi.lang._ndarray.Ndarray):
                 raise TaichiRuntimeTypeError(
                     "Ndarray shouldn't be passed in via `ti.template()`, please annotate your kernel using `ti.types.ndarray(...)` instead"
@@ -371,40 +382,46 @@ class TaichiCallableTemplateMapper:
             return arg
         if isinstance(anno, ArgPackType):
             if not isinstance(arg, ArgPack):
-                raise TaichiRuntimeTypeError(f"Argument must be a argument pack, got {type(arg)}")
+                raise TaichiRuntimeTypeError(f"Argument {arg_name} must be a argument pack, got {type(arg)}")
             return tuple(
-                TaichiCallableTemplateMapper.extract_arg(arg[name], dtype)
+                TaichiCallableTemplateMapper.extract_arg(arg[name], dtype, arg_name)
                 for index, (name, dtype) in enumerate(anno.members.items())
             )
         if isinstance(anno, texture_type.TextureType):
             if not isinstance(arg, taichi.lang._texture.Texture):
-                raise TaichiRuntimeTypeError(f"Argument must be a texture, got {type(arg)}")
+                raise TaichiRuntimeTypeError(f"Argument {arg_name} must be a texture, got {type(arg)}")
             if arg.num_dims != anno.num_dimensions:
                 raise TaichiRuntimeTypeError(
-                    f"TextureType dimension mismatch: expected {anno.num_dimensions}, got {arg.num_dims}"
+                    f"TextureType dimension mismatch for argument {arg_name}: expected {anno.num_dimensions}, got {arg.num_dims}"
                 )
             return (arg.num_dims,)
         if isinstance(anno, texture_type.RWTextureType):
             if not isinstance(arg, taichi.lang._texture.Texture):
-                raise TaichiRuntimeTypeError(f"Argument must be a texture, got {type(arg)}")
+                raise TaichiRuntimeTypeError(f"Argument {arg_name} must be a texture, got {type(arg)}")
             if arg.num_dims != anno.num_dimensions:
                 raise TaichiRuntimeTypeError(
-                    f"RWTextureType dimension mismatch: expected {anno.num_dimensions}, got {arg.num_dims}"
+                    f"RWTextureType dimension mismatch for argument {arg_name}: expected {anno.num_dimensions}, got {arg.num_dims}"
                 )
             if arg.fmt != anno.fmt:
-                raise TaichiRuntimeTypeError(f"RWTextureType format mismatch: expected {anno.fmt}, got {arg.fmt}")
+                raise TaichiRuntimeTypeError(
+                    f"RWTextureType format mismatch for argument {arg_name}: expected {anno.fmt}, got {arg.fmt}"
+                )
             # (penguinliong) '0' is the assumed LOD level. We currently don't
             # support mip-mapping.
             return arg.num_dims, arg.fmt, 0
         if isinstance(anno, ndarray_type.NdarrayType):
             if isinstance(arg, taichi.lang._ndarray.Ndarray):
-                anno.check_matched(arg.get_type())
+                anno.check_matched(arg.get_type(), arg_name)
                 needs_grad = (arg.grad is not None) if anno.needs_grad is None else anno.needs_grad
                 return arg.element_type, len(arg.shape), needs_grad, anno.boundary
+            if isinstance(arg, AnyArray):
+                ty = arg.get_type()
+                anno.check_matched(arg.get_type(), arg_name)
+                return ty.element_type, len(arg.shape), ty.needs_grad, anno.boundary
             # external arrays
             shape = getattr(arg, "shape", None)
             if shape is None:
-                raise TaichiRuntimeTypeError(f"Invalid argument into ti.types.ndarray(), got {arg}")
+                raise TaichiRuntimeTypeError(f"Invalid type for argument {arg_name}, got {arg}")
             shape = tuple(shape)
             element_shape = ()
             dtype = to_taichi_type(arg.dtype)
@@ -412,34 +429,34 @@ class TaichiCallableTemplateMapper:
                 if anno.ndim is not None:
                     if len(shape) != anno.dtype.ndim + anno.ndim:
                         raise ValueError(
-                            f"Invalid argument into ti.types.ndarray() - required array has ndim={anno.ndim} element_dim={anno.dtype.ndim}, "
-                            f"but the argument has {len(shape)} dimensions"
+                            f"Invalid value for argument {arg_name} - required array has ndim={anno.ndim} element_dim={anno.dtype.ndim}, "
+                            f"array with {len(shape)} dimensions is provided"
                         )
                 else:
                     if len(shape) < anno.dtype.ndim:
                         raise ValueError(
-                            f"Invalid argument into ti.types.ndarray() - required element_dim={anno.dtype.ndim}, "
-                            f"but the argument has only {len(shape)} dimensions"
+                            f"Invalid value for argument {arg_name} - required element_dim={anno.dtype.ndim}, "
+                            f"array with {len(shape)} dimensions is provided"
                         )
                 element_shape = shape[-anno.dtype.ndim :]
                 anno_element_shape = anno.dtype.get_shape()
                 if None not in anno_element_shape and element_shape != anno_element_shape:
                     raise ValueError(
-                        f"Invalid argument into ti.types.ndarray() - required element_shape={anno_element_shape}, "
-                        f"but the argument has element shape of {element_shape}"
+                        f"Invalid value for argument {arg_name} - required element_shape={anno_element_shape}, "
+                        f"array with element shape of {element_shape} is provided"
                     )
             elif anno.dtype is not None:
                 # User specified scalar dtype
                 if anno.dtype != dtype:
                     raise ValueError(
-                        f"Invalid argument into ti.types.ndarray() - required array has dtype={anno.dtype.to_string()}, "
-                        f"but the argument has dtype={dtype.to_string()}"
+                        f"Invalid value for argument {arg_name} - required array has dtype={anno.dtype.to_string()}, "
+                        f"array with dtype={dtype.to_string()} is provided"
                     )
 
                 if anno.ndim is not None and len(shape) != anno.ndim:
                     raise ValueError(
-                        f"Invalid argument into ti.types.ndarray() - required array has ndim={anno.ndim}, "
-                        f"but the argument has {len(shape)} dimensions"
+                        f"Invalid value for argument {arg_name} - required array has ndim={anno.ndim}, "
+                        f"array with {len(shape)} dimensions is provided"
                     )
             needs_grad = getattr(arg, "requires_grad", False) if anno.needs_grad is None else anno.needs_grad
             element_type = (
@@ -456,7 +473,7 @@ class TaichiCallableTemplateMapper:
     def extract(self, args):
         extracted = []
         for arg, kernel_arg in zip(args, self.arguments):
-            extracted.append(self.extract_arg(arg, kernel_arg.annotation))
+            extracted.append(self.extract_arg(arg, kernel_arg.annotation, kernel_arg.name))
         return tuple(extracted)
 
     def lookup(self, args):
